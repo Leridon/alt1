@@ -8,3 +8,8 @@ declare module "*.fontmeta.json" {
 	var t: OCR.FontDefinition;
 	export default t;
 }
+
+declare module "*.html" {
+	var t: string;
+	export default t;
+}
