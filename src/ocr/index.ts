@@ -12,6 +12,7 @@ export type Charinfo = {
 	chr: string,
 	bonus: number,
 	secondary: boolean,
+	templatex: number,
 	pixels: number[]
 };
 export type FontDefinition = {
@@ -22,7 +23,8 @@ export type FontDefinition = {
 	height: number,
 	basey: number,
 	minrating?: number,
-	maxspaces?: number
+	maxspaces?: number,
+	bonusperpixel?: number
 };
 export type ColortTriplet = [number, number, number];
 
@@ -460,59 +462,72 @@ export function readChar(buffer: ImageData, font: FontDefinition, col: ColortTri
 	var shiftx = 0;
 	var shifty = font.basey;
 	var shadow = font.shadow;
+	var bonusperpixel = font.bonusperpixel ?? 0;
 	var debugobj: Chardebug[] | null = null;
 	var debugimg: ImageData | null = null;
+	var maxpenalty = 400;
 	if (debug.trackread) {
 		var name = x + ";" + y + " " + JSON.stringify(col);
 		if (!debugout[name]) { debugout[name] = []; }
 		debugobj = debugout[name];
 	}
 
-	//===== make sure the full domain is inside the bitmap/buffer ======
-	if (y < 0 || y + font.height >= buffer.height) { return null; }
-	if (!backwards) {
-		if (x < 0 || x + font.width > buffer.width) { return null; }
-	}
-	else {
-		if (x - font.width < 0 || x > buffer.width) { return null; }
-	}
-
 	//====== start reading the char ======
 	var scores: { score: number, sizescore: number, chr: Charinfo }[] = [];
+	let valuesperpixel = font.shadow ? 4 : 3;
 	charloop: for (var chr = 0; chr < font.chars.length; chr++) {
 		var chrobj = font.chars[chr];
 		if (chrobj.secondary && !allowSecondary) { continue; }
-		const scoreobj = { score: 0, sizescore: 0, chr: chrobj };
+		let originalpixels = chrobj.pixels.length / valuesperpixel;
+		const scoreobj = {
+			score: 0,
+			// font definitions used to have bonus per pixel baked in, subtract it here to remain backwards compatible
+			sizescore: -chrobj.bonus + originalpixels * bonusperpixel,
+			pixelcount: 0,
+			chr: chrobj
+		};
 		var chrx = (backwards ? x - chrobj.width : x);
-
 
 		if (debug.trackread) {
 			debugimg = new ImageData(font.width, font.height);
 		}
 
-		for (var a = 0; a < chrobj.pixels.length;) {
-			var i = (chrx + chrobj.pixels[a]) * 4 + (y + chrobj.pixels[a + 1]) * buffer.width * 4;
+		for (var a = 0; a < chrobj.pixels.length; a += valuesperpixel) {
+			var subx = chrobj.pixels[a];
+			var suby = chrobj.pixels[a + 1];
+			var i = (chrx + subx) * 4 + (y + suby) * buffer.width * 4;
 			var penalty = 0;
+
+			// skip if out of bounds or masked out
+			if (y + suby < 0 || y + suby >= buffer.height) { continue; }
+			if (!backwards && (x + subx < 0 || x + subx >= buffer.width)) { continue; }
+			if (backwards && (x + subx < 0 || x + subx >= buffer.width)) { continue; }
+			if (buffer.data[i + 3] < 128) { continue; }
+
 			if (!shadow) {
 				penalty = canblend(buffer.data[i], buffer.data[i + 1], buffer.data[i + 2], col[0], col[1], col[2], chrobj.pixels[a + 2] / 255);
-				a += 3;
 			}
 			else {
 				var lum = chrobj.pixels[a + 3] / 255;
 				penalty = canblend(buffer.data[i], buffer.data[i + 1], buffer.data[i + 2], col[0] * lum, col[1] * lum, col[2] * lum, chrobj.pixels[a + 2] / 255);
-				a += 4;
 			}
 			scoreobj.score += penalty;
+			scoreobj.sizescore += penalty - bonusperpixel;
+			scoreobj.pixelcount++;
 
 			// Short circuit the loop as soon as the penalty threshold (400) is reached
-			if (!debugobj && scoreobj.score > 400) {
-				continue charloop; 
+			if (!debugobj && scoreobj.score > maxpenalty) {
+				continue charloop;
 			}
 
 			//TODO add compiler flag to this to remove it for performance
 			if (debugimg) { debugimg.setPixel(chrobj.pixels[a], chrobj.pixels[a + 1], [penalty, penalty, penalty, 255]); }
 		}
-		scoreobj.sizescore = scoreobj.score - chrobj.bonus;
+
+		// if less than 60% of pixel are checked, or if the char is very small and not all pixels match, discard this char as a possible match
+		if (scoreobj.pixelcount < originalpixels * 0.6 || (originalpixels <= 6 && scoreobj.pixelcount < originalpixels)) {
+			continue;
+		}
 		if (debugobj) { debugobj.push({ chr: chrobj.chr, score: scoreobj.sizescore, rawscore: scoreobj.score, img: debugimg! }); }
 		scores.push(scoreobj)
 	}
@@ -523,14 +538,21 @@ export function readChar(buffer: ImageData, font: FontDefinition, col: ColortTri
 	}
 
 	let winchr: (typeof scores)[number] | null = null
-
 	for (const chrscore of scores) {
-		if (!winchr || (chrscore && chrscore.sizescore < winchr.sizescore)) winchr = chrscore
+		if (!winchr || (chrscore && chrscore.sizescore < winchr.sizescore)) {
+			winchr = chrscore;
+		}
 	}
+	if (!winchr || winchr.score > maxpenalty) { return null; }
 
-	if (!winchr || winchr.score > 400) { return null; }
-
-	return { chr: winchr.chr.chr, basechar: winchr.chr, x: x + shiftx, y: y + shifty, score: winchr.score, sizescore: winchr.sizescore };
+	return {
+		chr: winchr.chr.chr,
+		basechar: winchr.chr,
+		x: x + shiftx,
+		y: y + shifty,
+		score: winchr.score,
+		sizescore: winchr.sizescore
+	};
 }
 export type ReadCharInfo = { chr: string, basechar: Charinfo, x: number, y: number, score: number, sizescore: number };
 
@@ -626,7 +648,15 @@ export function generateFont(unblended: ImageData, chars: string, seconds: strin
 	//initial vars
 	var miny = unblended.height - 1;
 	var maxy = 0;
-	var font = { chars: [] as Charinfo[], width: 0, spacewidth: spacewidth, shadow: shadow, height: 0, basey: 0 };
+	var font = {
+		chars: [] as Charinfo[],
+		width: 0,
+		spacewidth: spacewidth,
+		shadow: shadow,
+		height: 0,
+		basey: 0,
+		bonusperpixel: 5
+	};
 	var ds: false | number = false;
 
 	type internalcharinfo = Charinfo & { ds: number, de: number };
@@ -648,6 +678,7 @@ export function generateFont(unblended: ImageData, chars: string, seconds: strin
 					ds: ds,
 					de: de,
 					width: de - ds,
+					templatex: ds,
 					chr: char,
 					bonus: (bonusses && bonusses[char]) || 0,
 					secondary: seconds.indexOf(chars[chardata.length]) != -1,
@@ -682,14 +713,21 @@ export function generateFont(unblended: ImageData, chars: string, seconds: strin
 					chr.pixels.push(x, y);
 					chr.pixels.push(unblended.data[i]);
 					if (shadow) { chr.pixels.push(unblended.data[i + 1]); }
-					chr.bonus += 5;
+					chr.bonus += font.bonusperpixel;
 				}
 			}
 		}
 		//prevent js from doing the thing with unnecessary output precision
 		chr.bonus = +chr.bonus.toFixed(3);
 
-		font.chars.push({ width: chr.width, bonus: chr.bonus, chr: chr.chr, pixels: chr.pixels, secondary: chr.secondary });
+		font.chars.push({
+			width: chr.width,
+			templatex: chr.templatex,
+			bonus: chr.bonus,
+			chr: chr.chr,
+			pixels: chr.pixels,
+			secondary: chr.secondary
+		});
 	}
 
 	return font;
